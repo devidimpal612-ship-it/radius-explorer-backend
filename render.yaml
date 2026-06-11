@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: radius-explorer-api
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: PORT
+        value: 4000
