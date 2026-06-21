@@ -39,6 +39,31 @@ app.get("/api/search", async (req, res) => {
   }
 });
 
+// ── AUTOCOMPLETE (live suggestions as user types) ──────────
+app.get("/api/autocomplete", async (req, res) => {
+  const { q } = req.query;
+  if (!q || q.trim().length < 3) return res.json({ suggestions: [] });
+
+  try {
+    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=6&addressdetails=1`;
+    const response = await fetch(url, {
+      headers: { "User-Agent": "RadiusExplorer/1.0 contact@radiusexplorer.com" },
+    });
+    const data = await response.json();
+
+    const suggestions = data.map((item) => ({
+      lat: parseFloat(item.lat),
+      lon: parseFloat(item.lon),
+      display_name: item.display_name,
+      type: item.type,
+    }));
+
+    res.json({ suggestions });
+  } catch (err) {
+    res.status(500).json({ error: "Autocomplete failed", detail: err.message });
+  }
+});
+
 // ── PLACES (find places in radius via Overpass API) ───────
 app.get("/api/places", async (req, res) => {
   const { lat, lon, radius = 1000 } = req.query;
@@ -54,8 +79,11 @@ app.get("/api/places", async (req, res) => {
       node["tourism"](around:${r},${lat},${lon});
       node["healthcare"](around:${r},${lat},${lon});
       node["leisure"](around:${r},${lat},${lon});
+      way["highway"]["name"](around:${Math.min(r, 1500)},${lat},${lon});
     );
     out body;
+    >;
+    out skel qt;
   `;
 
   try {
@@ -66,22 +94,65 @@ app.get("/api/places", async (req, res) => {
     });
     const data = await response.json();
 
-    const places = data.elements.map((el) => ({
-      id: el.id,
-      lat: el.lat,
-      lon: el.lon,
-      name: el.tags?.name || "Unnamed",
-      type:
-        el.tags?.amenity ||
-        el.tags?.shop ||
-        el.tags?.tourism ||
-        el.tags?.healthcare ||
-        el.tags?.leisure ||
-        "place",
-      phone: el.tags?.phone || null,
-      website: el.tags?.website || null,
-      opening_hours: el.tags?.opening_hours || null,
-    }));
+    // Build lookup of node coordinates (for way geometry) and named roads
+    const nodeCoords = {};
+    data.elements.forEach((el) => {
+      if (el.type === "node") nodeCoords[el.id] = { lat: el.lat, lon: el.lon };
+    });
+
+    const roads = data.elements
+      .filter((el) => el.type === "way" && el.tags?.highway && el.tags?.name)
+      .map((way) => {
+        const coords = (way.nodes || [])
+          .map((id) => nodeCoords[id])
+          .filter(Boolean);
+        return { name: way.tags.name, coords };
+      })
+      .filter((r) => r.coords.length > 0);
+
+    function nearestRoadName(plat, plon) {
+      let best = null;
+      let bestDist = Infinity;
+      for (const road of roads) {
+        for (const c of road.coords) {
+          const d = Math.hypot(c.lat - plat, c.lon - plon);
+          if (d < bestDist) {
+            bestDist = d;
+            best = road.name;
+          }
+        }
+      }
+      return best;
+    }
+
+    const places = data.elements
+      .filter((el) => el.type === "node" && (el.tags?.amenity || el.tags?.shop || el.tags?.tourism || el.tags?.healthcare || el.tags?.leisure))
+      .map((el) => {
+        const type =
+          el.tags?.amenity ||
+          el.tags?.shop ||
+          el.tags?.tourism ||
+          el.tags?.healthcare ||
+          el.tags?.leisure ||
+          "place";
+
+        let name = el.tags?.name;
+        if (!name) {
+          const nearRoad = nearestRoadName(el.lat, el.lon);
+          name = nearRoad ? `${formatType(type)} near ${nearRoad}` : `${formatType(type)} (unnamed)`;
+        }
+
+        return {
+          id: el.id,
+          lat: el.lat,
+          lon: el.lon,
+          name,
+          type,
+          phone: el.tags?.phone || null,
+          website: el.tags?.website || null,
+          opening_hours: el.tags?.opening_hours || null,
+        };
+      });
 
     // Group by type for stats
     const stats = places.reduce((acc, p) => {
@@ -94,6 +165,12 @@ app.get("/api/places", async (req, res) => {
     res.status(500).json({ error: "Places search failed", detail: err.message });
   }
 });
+
+function formatType(type) {
+  return type
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
 
 // ── DISTANCE (via OSRM public API) ────────────────────────
 app.get("/api/distance", async (req, res) => {
