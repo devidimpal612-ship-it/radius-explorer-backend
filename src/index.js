@@ -8,6 +8,16 @@ const PORT = process.env.PORT || 4000;
 app.use(cors());
 app.use(express.json());
 
+// ── SIMPLE REQUEST QUEUE (prevents Nominatim rate-limit 403/500s) ──
+let lastNominatimCall = 0;
+async function queuedFetch(url, options) {
+  const now = Date.now();
+  const wait = Math.max(0, 1000 - (now - lastNominatimCall)); // min 1s gap
+  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+  lastNominatimCall = Date.now();
+  return fetch(url, options);
+}
+
 // ── HEALTH CHECK ──────────────────────────────────────────
 app.get("/", (req, res) => {
   res.json({ status: "Radius Explorer API running" });
@@ -20,7 +30,7 @@ app.get("/api/search", async (req, res) => {
 
   try {
     const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=5&addressdetails=1`;
-    const response = await fetch(url, {
+    const response = await queuedFetch(url, {
       headers: { "User-Agent": "RadiusExplorer/1.0 contact@radiusexplorer.com" },
     });
     const data = await response.json();
@@ -46,10 +56,27 @@ app.get("/api/autocomplete", async (req, res) => {
 
   try {
     const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=6&addressdetails=1`;
-    const response = await fetch(url, {
+    const response = await queuedFetch(url, {
       headers: { "User-Agent": "RadiusExplorer/1.0 contact@radiusexplorer.com" },
     });
-    const data = await response.json();
+
+    if (!response.ok) {
+      console.error("Nominatim returned status:", response.status);
+      return res.json({ suggestions: [] });
+    }
+
+    const text = await response.text();
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (parseErr) {
+      console.error("Nominatim returned non-JSON:", text.slice(0, 200));
+      return res.json({ suggestions: [] });
+    }
+
+    if (!Array.isArray(data)) {
+      return res.json({ suggestions: [] });
+    }
 
     const suggestions = data.map((item) => ({
       lat: parseFloat(item.lat),
@@ -60,7 +87,8 @@ app.get("/api/autocomplete", async (req, res) => {
 
     res.json({ suggestions });
   } catch (err) {
-    res.status(500).json({ error: "Autocomplete failed", detail: err.message });
+    console.error("Autocomplete error:", err.message);
+    res.json({ suggestions: [] }); // fail gracefully, never 500 the frontend
   }
 });
 
